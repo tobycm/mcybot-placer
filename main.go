@@ -3,17 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"image"
+	"image/color"
 	"net"
+	"os/signal"
 	"runtime"
 	"sync"
+	"syscall"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
-)
-
-var (
-	// imagePath = "./tobydio-square.jpg"
-	imagePath = "./miyab-square.png"
 )
 
 // A struct to hold the data for a single pixel job
@@ -23,96 +22,166 @@ type pixelJob struct {
 }
 
 func main() {
-	fmt.Println("Hello, World!")
+	fmt.Println("Starting Art Defense Bot...")
+	fmt.Println("Press Ctrl+C to stop.")
 
-	ctx := context.Background()
+	// --- Graceful Shutdown Setup ---
+	// Create a context that is canceled when a SIGINT (Ctrl+C) or SIGTERM is received.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel() // Ensure cancel is called on exit to clean up resources
+
+	// --- Run the bot for a single image ---
+	imagePath := "./tobydio-square.jpg" // Defend this one image
+	fmt.Printf("\n--- Painting and defending with %s ---\n", imagePath)
+
+	// This function will block until the context is canceled (by Ctrl+C).
+	err := sendAndDefendImage(ctx, imagePath)
+	if err != nil && err != context.Canceled {
+		fmt.Printf("Error during send/defend cycle: %v\n", err)
+	}
+
+	fmt.Println("\nShutdown complete.")
+}
+
+// sendAndDefendImage handles the entire lifecycle for one image:
+// painting it once, then defending it until the context is canceled.
+func sendAndDefendImage(ctx context.Context, imagePath string) error {
 	conn, _, _, err := ws.Dial(ctx, "ws://34.16.209.13:3001/ws")
 	if err != nil {
-		fmt.Println("Error connecting:", err)
-		return
+		return fmt.Errorf("error connecting: %w", err)
 	}
 	defer conn.Close()
 
+	// This call relies on your existing loadImage function.
 	placeImage, err := loadImage(imagePath)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return err
 	}
 
-	// message structure:
-	// byte 1-2: x position
-	// byte 3-4: y position
-	// byte 5: r
-	// byte 6: g
-	// byte 7: b
-	// --- Concurrency Setup ---
+	// --- 1. Create an in-memory reference of the correct art ---
+	artReference := make(map[image.Point]color.RGBA)
+	bounds := placeImage.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := placeImage.At(x, y).RGBA()
+			artReference[image.Point{x, y}] = color.RGBA{
+				R: uint8(r >> 8),
+				G: uint8(g >> 8),
+				B: uint8(b >> 8),
+			}
+		}
+	}
+	fmt.Println("Created in-memory art reference for defense.")
+
 	var wg sync.WaitGroup
-	var connMutex sync.Mutex // The lock to protect the connection
+	var connMutex sync.Mutex
+	jobs := make(chan pixelJob, 1000) // A healthy buffer for offense and defense jobs
 
-	// A channel to act as a job queue for the workers
-	jobs := make(chan pixelJob, 100)
-
-	// Determine number of worker goroutines. A good starting point is the number of CPU cores.
-	numWorkers := runtime.NumCPU() / 2
-	fmt.Printf("Starting %d worker goroutines to send pixels...\n", numWorkers)
-
-	// Start the worker pool
+	// --- 2. Start the consumer pool (the senders) ---
+	numWorkers := runtime.NumCPU() * 6
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go worker(&wg, &connMutex, conn, jobs)
 	}
 
-	// --- Producer ---
-	// The main goroutine will now be the "producer". It creates jobs
-	// and puts them on the channel for the workers to pick up.
-	fmt.Println("Producing pixel jobs...")
-	bounds := placeImage.Bounds()
-	for y := 0; y < bounds.Dy(); y++ {
-		for x := 0; x < bounds.Dx(); x++ {
-			r, g, b, _ := placeImage.At(x, y).RGBA()
-			jobs <- pixelJob{
-				x: x, y: y,
-				r: uint8(r >> 8),
-				g: uint8(g >> 8),
-				b: uint8(b >> 8),
+	// --- 3. Start the "Defense" reader goroutine ---
+	go reader(ctx, conn, artReference, jobs)
+
+	// --- 4. Run the initial "Offense" producer ---
+	go func() {
+		fmt.Println("Starting initial paint ('Offense')...")
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				correctColor := artReference[image.Point{x, y}]
+				job := pixelJob{
+					x: x, y: y,
+					r: correctColor.R,
+					g: correctColor.G,
+					b: correctColor.B,
+				}
+				select {
+				case jobs <- job:
+				case <-ctx.Done():
+					fmt.Println("Initial paint cancelled.")
+					return
+				}
+			}
+		}
+		fmt.Println("Initial paint complete. Now in defense-only mode.")
+	}()
+
+	// --- 5. Wait for shutdown signal ---
+	<-ctx.Done()
+
+	// --- 6. Graceful Shutdown ---
+	fmt.Println("Shutdown signal received. Closing workers...")
+	close(jobs) // Signal workers to stop.
+	wg.Wait()   // Wait for them to finish.
+	fmt.Println("All workers have shut down.")
+	return context.Canceled
+}
+
+// The new reader goroutine for our "Defense" system.
+func reader(ctx context.Context, conn net.Conn, artReference map[image.Point]color.RGBA, jobs chan<- pixelJob) {
+	for {
+		msg, _, err := wsutil.ReadServerData(conn)
+		if err != nil {
+			select {
+			case <-ctx.Done(): // If the context is cancelled, this is an expected error.
+			default:
+				fmt.Printf("Reader error: %v\n", err)
+			}
+			return
+		}
+
+		if len(msg)%7 != 0 {
+			continue // Ignore malformed messages.
+		}
+
+		for i := 0; i < len(msg); i += 7 {
+			pixelBytes := msg[i : i+7]
+			x := int(pixelBytes[0])<<8 | int(pixelBytes[1])
+			y := int(pixelBytes[2])<<8 | int(pixelBytes[3])
+
+			correctColor, ok := artReference[image.Point{x, y}]
+			if !ok {
+				continue // This pixel is outside our art, ignore it.
+			}
+
+			if pixelBytes[4] != correctColor.R || pixelBytes[5] != correctColor.G || pixelBytes[6] != correctColor.B {
+				// fmt.Printf("DEFENDING pixel at (%d, %d). Reverting change.\n", x, y)
+				defenseJob := pixelJob{
+					x: x, y: y,
+					r: correctColor.R,
+					g: correctColor.G,
+					b: correctColor.B,
+				}
+				select {
+				case jobs <- defenseJob:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}
-	close(jobs) // Close the channel to signal that no more jobs are coming.
-
-	// --- Wait for Completion ---
-	fmt.Println("All jobs produced. Waiting for workers to finish...")
-	wg.Wait() // Wait for all goroutines in the WaitGroup to call Done()
-	fmt.Println("All pixels sent successfully!")
-
 }
 
-// --- Worker Function ---
-// This function is run by each of our concurrent goroutines.
+// The worker function is unchanged. It just sends whatever job it gets.
 func worker(wg *sync.WaitGroup, connMutex *sync.Mutex, conn net.Conn, jobs <-chan pixelJob) {
 	defer wg.Done()
-
 	for job := range jobs {
 		msg := []byte{
 			byte(job.x >> 8), byte(job.x & 0xff),
 			byte(job.y >> 8), byte(job.y & 0xff),
 			job.r, job.g, job.b,
 		}
-
-		// *** CRITICAL SECTION ***
-		// Lock the mutex before writing to the connection to prevent data races.
 		connMutex.Lock()
-
 		err := wsutil.WriteClientBinary(conn, msg)
-
-		// Unlock the mutex immediately after writing so another worker can proceed.
 		connMutex.Unlock()
-		// *** END CRITICAL SECTION ***
-
 		if err != nil {
-			// Note: In a real app, you might want a more robust error handling
-			// strategy than just printing, as one error could cascade.
-			fmt.Println("Error sending message:", err)
+			if err != net.ErrClosed {
+				fmt.Printf("Error sending message: %v\n", err)
+			}
 		}
 	}
 }
