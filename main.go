@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	wsUrl        = "ws://34.162.179.28:8001/ws"      // The WebSocket URL to connect to
+	wsUrl        = "wss://place.tobycm.dev/ws"       // The WebSocket URL to connect to
 	imagePath    = "./r-printedcircuitboard-2k.jpeg" // The path to the image we want to defend
 	packetStruct = "old"                             // new or old, new is 16 bit x y, old is 32 bit x y
 )
@@ -159,7 +159,7 @@ func reader(ctx context.Context, conn net.Conn, artReference map[image.Point]col
 				}
 
 				if pixelBytes[4] != correctColor.R || pixelBytes[5] != correctColor.G || pixelBytes[6] != correctColor.B {
-					// fmt.Printf("DEFENDING pixel at (%d, %d). Reverting change.\n", x, y)
+					fmt.Printf("DEFENDING pixel at (%d, %d). Reverting change.\n", x, y)
 					defenseJob := pixelJob{
 						x: x, y: y,
 						r: correctColor.R,
